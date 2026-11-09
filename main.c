@@ -7,9 +7,9 @@
  * Text formatting and integer division are implemented in this same file.
  *
  * Wiring (3.3 V GPIO):
- *   TFT SCK=PA5, MOSI=PA7, CS=PB1, DC=PB10, RESET=PB11.
- *   Buttons: HOLD=PB12, UP=PB13, DOWN=PB14, SET=PB15; other ends to GND.
- *   ADC: PA0. Input -> R2 -> PA0; PA0 -> R1 -> GND. PA2 is UNUSED.
+ *   TFT SCK=PA5, MOSI=PA7, CS=PB1, DC=PB10, RESET=PB0.
+ *   AUTOSET: PA1 to GND. RUN/HOLD: PA2 to GND. Internal pull-ups enabled.
+ *   ADC: PA0 only. Input -> R2 -> PA0; PA0 -> R1 -> GND.
  *   R2=9100 ohms, R1=1000 ohms: attenuation 10.1:1, nominal FS=33.33 V.
  *   Use 0..30 V positive input for headroom. Keep PA0 within 0..VDDA.
  *   Upper clamp: anode PA0, cathode 3.3 V. Lower: anode GND, cathode PA0.
@@ -25,12 +25,20 @@
  * SPI1=8 MHz, within the ILI9341's documented serial write timing.
  * HSI tolerance affects timing/frequency; calibrate against a known reference.
  *
- * Controls: SET cycles TIME / VOLTS / TRIG. UP/DOWN adjust the selected item.
- * HOLD freezes/resumes the last trace. TRIG is % of the captured signal span.
- * Vertical zoom only changes drawing; the physical divider always stays fixed.
+ * PA1 AUTOSET: resume RUN; find time/div, volts/div, vertical position and
+ * midpoint trigger. A frequency search also runs once at power-up.
+ * PA2 RUN/HOLD: freeze/resume the last trace; retry after a capture error.
+ * Autoset is a one-shot action. Press PA1 again after changing the signal.
+ * B: on the screen is the voltage at the BOTTOM of the plot (not ADC bias).
+ * Vertical scale/position only change drawing; the divider stays fixed.
  * Measurements are VMIN/VMAX/VPP and an estimated rising-edge frequency.
- * The trigger aligns a captured block in software; AUTO means no crossing found.
- * After a capture error, HOLD retries. No simulated data or software fallback.
+ * TRIG/FREE indicate software alignment / no reliable crossing.
+ * Slow/DC/no-signal searches can take about 0.7 s once; RUN uses the selected
+ * sweep. Low-frequency signals still require enough acquisition time.
+ * Grid drawn once; subsequent transfers update only changed trace segments
+ * and characters. ADC capture overlaps plotting. Maximum UI target is 30 Hz.
+ * No full framebuffer, no simulated data, and no software ADC fallback.
+ * Build with -O2 in CubeIDE for the intended screen-update performance.
  *
  * Calibration: enter measured VDDA and resistor values below. A known DC input
  * can additionally calibrate gain/offset. ADC resolution is not absolute accuracy.
@@ -52,6 +60,10 @@
 #define LCD_W             320U
 #define PLOT_TOP          32U
 #define PLOT_H            192U
+#define FRAME_INTERVAL_US 33333U
+#define KEY_AUTO          1U
+#define KEY_RUN           2U
+#define SIGNAL_MIN_COUNTS 20U
 #define LCD_CS            (1U << 1)
 #define LCD_DC            (1U << 10)
 #define LCD_RST           (1U << 0)
@@ -66,16 +78,22 @@
 #define DMA_ERROR0        (DMA_LISR_FEIF0 | DMA_LISR_DMEIF0 | DMA_LISR_TEIF0)
 
 static volatile uint16_t samples[ADC_COUNT];
-static uint16_t trace[LCD_W], trace_y[LCD_W];
+static uint16_t trace[LCD_W], trace_y[LCD_W], old_y[LCD_W];
 static const uint32_t time_us[] = {2,5,10,20,50,100,200,500,1000,2000,5000,10000};
 static const uint32_t volts_mv[] = {100,200,500,1000,2000,5000,10000};
-static uint8_t time_index=5, volt_index=6, selected=0, hold=0, have_trace=0;
+static const uint32_t probe_ticks[] = {64,256,1024,4096,16384,20000};
+static uint8_t time_index=5, volt_index=6, hold=0, have_trace=0, plot_valid=0;
 static uint8_t active=0, fault=0, triggered=0, high_clip=0, trigger_percent=50;
+static uint8_t autoset_busy=1, probe_index=0;
+static uint16_t raw_lo=0, raw_hi=0;
 static uint32_t period_ticks, capture_started, capture_timeout;
-static uint32_t last_period=64, frequency_hz=0;
-static int32_t vmin_mv=0, vmax_mv=0, vpp_mv=0;
+static uint32_t last_period=64, frequency_hz=0, detected_hz=0;
+static uint32_t input_gain_q16=0, last_frame_started=0, last_frame_done=0, update_ms=0;
+static int32_t vmin_mv=0, vmax_mv=0, vpp_mv=0, display_bottom_mv=0;
 static uint8_t key_stable=0, key_candidate=0, key_events=0;
 static uint32_t key_changed=0;
+static char label_cache[4][53];
+static uint16_t label_color[4];
 
 void Error_Handler(void);
 
@@ -146,10 +164,10 @@ static void timebase_init(void)
     TIM5->CR1=TIM_CR1_CEN;
 }
 
-/* PB12..15 have internal pull-ups; one debounced press generates one event. */
+/* PA1/PA2 are active-low. One debounced press generates one event. */
 static void keys_scan(void)
 {
-    uint8_t now=(uint8_t)((~GPIOB->IDR>>12)&15U);
+    uint8_t now=(uint8_t)((~GPIOA->IDR>>1)&3U);
     if (now!=key_candidate) { key_candidate=now; key_changed=micros_now(); }
     if (now!=key_stable && (uint32_t)(micros_now()-key_changed)>=20000U) {
         key_events |= (uint8_t)(now & (uint8_t)~key_stable);
@@ -166,9 +184,11 @@ static void pins_init(void)
     (void)RCC->AHB1ENR;
     (void)RCC->APB2ENR;
     (void)RCC->APB1ENR;
-    GPIOA->MODER = (GPIOA->MODER & ~((3U<<0)|(3U<<10)|(3U<<14))) |
-                   (3U<<0)|(2U<<10)|(2U<<14); // PA0 la chan analog; PA5/7 la chan alternate.
-    GPIOA->PUPDR &= ~((3U<<0)|(3U<<10)|(3U<<14));
+    GPIOA->MODER = (GPIOA->MODER & ~((3U<<0)|(3U<<2)|(3U<<4)|
+                                    (3U<<10)|(3U<<14))) |
+                   (3U<<0)|(2U<<10)|(2U<<14); /* PA1/PA2 digital inputs. */
+    GPIOA->PUPDR = (GPIOA->PUPDR & ~((3U<<0)|(3U<<2)|(3U<<4)|
+                                    (3U<<10)|(3U<<14))) | (1U<<2)|(1U<<4);
     GPIOA->OTYPER &= ~((1U<<5)|(1U<<7));
     GPIOA->OSPEEDR |= (3U<<10)|(3U<<14);
     GPIOA->AFR[0] = (GPIOA->AFR[0] & ~((15U<<20)|(15U<<28))) |
@@ -182,8 +202,6 @@ static void pins_init(void)
         }
     }
     GPIOB->OTYPER &= ~outputs;
-    GPIOB->MODER &= ~0xFF000000U;
-    GPIOB->PUPDR = (GPIOB->PUPDR & ~0xFF000000U) | 0x55000000U;
     SPI1->CR1=0;
     SPI1->CR2=0;
     SPI1->CR1=SPI_CR1_MSTR | (2U<<3) | SPI_CR1_SSM | SPI_CR1_SSI |
@@ -198,7 +216,7 @@ static void pins_init(void)
     ADC1->SQR3=0; /* ADC_IN0 = PA0. */
 }
 
-static void spi_byte(uint8_t value)
+static inline void spi_byte(uint8_t value)
 {
     while (!(SPI1->SR & SPI_SR_TXE)) { }
     *(volatile uint8_t *)&SPI1->DR=value;
@@ -232,7 +250,7 @@ static void lcd_window(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1)
 }
 
 static void lcd_close(void) { spi_idle(); GPIOB->BSRR=LCD_CS; }
-static void pixel_color(uint16_t c) { spi_byte((uint8_t)(c>>8)); spi_byte((uint8_t)c); }
+static inline void pixel_color(uint16_t c) { spi_byte((uint8_t)(c>>8)); spi_byte((uint8_t)c); }
 
 static void lcd_fill(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t c)
 {
@@ -286,25 +304,51 @@ static const uint8_t glyphs[][5]={
  {0x20,0x10,8,4,2},{0x63,0x13,8,0x64,0x63}
 };
 
-static void lcd_text(uint16_t x, uint16_t y, const char *s, uint16_t color)
+static void lcd_char(uint16_t x, uint16_t y, char c, uint16_t color)
 {
-    while (*s!=0 && x+6U<=LCD_W) {
-        uint32_t g=36; /* Unsupported character -> space. */
-        for (uint32_t i=0; i<sizeof(glyph_names)-1U; ++i)
-            if (glyph_names[i]==*s) { g=i; break; }
-        lcd_window(x,y,(uint16_t)(x+5U),(uint16_t)(y+7U));
-        for (uint32_t row=0; row<8U; ++row)
-            for (uint32_t col=0; col<6U; ++col)
-                pixel_color(col<5U && ((glyphs[g][col]>>row)&1U) ? color : BLACK);
-        lcd_close(); x+=6U; ++s;
+    uint32_t g=36; /* Unsupported character -> space. */
+    for (uint32_t i=0; i<sizeof(glyph_names)-1U; ++i)
+        if (glyph_names[i]==c) { g=i; break; }
+    lcd_window(x,y,(uint16_t)(x+5U),(uint16_t)(y+7U));
+    for (uint32_t row=0; row<8U; ++row)
+        for (uint32_t col=0; col<6U; ++col)
+            pixel_color(col<5U && ((glyphs[g][col]>>row)&1U) ? color : BLACK);
+    lcd_close();
+}
+
+/* Rewrite changed characters only, including spaces after shorter new text. */
+static void label_draw(uint32_t row, const char *text, uint16_t color)
+{
+    static const uint16_t y[]={0,10,20,228};
+    uint8_t ended=0;
+    for (uint32_t col=0; col<53U; ++col) {
+        char c=' ';
+        if (!ended) {
+            c=*text;
+            if (c==0) { ended=1; c=' '; }
+            else ++text;
+        }
+        if (label_cache[row][col]!=c || label_color[row]!=color) {
+            lcd_char((uint16_t)(col*6U),y[row],c,color);
+            label_cache[row][col]=c;
+        }
     }
+    label_color[row]=color;
+    keys_scan();
+}
+
+/* Calibrate once. The hot drawing path uses multiplication, not division. */
+static void calibration_init(void)
+{
+    uint64_t full_q16=divide_u64((uint64_t)VDDA_MV*(R1_OHMS+R2_OHMS)*65536U,
+                                 R1_OHMS);
+    input_gain_q16=(uint32_t)divide_u64(full_q16*(uint64_t)CAL_GAIN_PPM+
+                                      2047500000ULL,4095000000ULL);
 }
 
 static int32_t input_mv(uint16_t raw)
 {
-    uint64_t full=divide_u64((uint64_t)VDDA_MV*(R1_OHMS+R2_OHMS),R1_OHMS);
-    uint64_t value=divide_u64((uint64_t)raw*full+2047U,4095U);
-    return (int32_t)divide_u64(value*(uint64_t)CAL_GAIN_PPM,1000000U)+CAL_OFFSET_MV;
+    return (int32_t)(((uint64_t)raw*input_gain_q16+32768U)>>16)+CAL_OFFSET_MV;
 }
 
 /* Bounded text append and decimal conversion; no printf/string library calls. */
@@ -357,8 +401,8 @@ static void capture_stop(void)
 
 static void capture_start(void)
 {
-    /* >=1 us sampling interval. At slower sweeps there is one sample/pixel. */
-    period_ticks=time_us[time_index]*2U;
+    /* Autoset searches from 1 MS/s downward. RUN uses the selected sweep. */
+    period_ticks=autoset_busy ? probe_ticks[probe_index] : time_us[time_index]*2U;
     if (period_ticks<64U) period_ticks=64U;
     capture_stop();
     TIM2->CR2=0; /* Prevent EGR.UG from accidentally triggering a conversion. */
@@ -397,129 +441,225 @@ static uint8_t capture_poll(void)
     return result;
 }
 
-static void analyze_capture(void)
+/* Analyze a completed DMA block. Displayed measurements remain frozen in HOLD. */
+static void measure_capture(void)
 {
-    uint16_t lo=4095, hi=0;
+    raw_lo=4095; raw_hi=0;
     for (uint32_t i=0; i<ADC_COUNT; ++i) {
         uint16_t s=samples[i];
-        if (s<lo) lo=s;
-        if (s>hi) hi=s;
+        if (s<raw_lo) raw_lo=s;
+        if (s>raw_hi) raw_hi=s;
     }
-    uint16_t level=(uint16_t)(lo+(uint32_t)(hi-lo)*trigger_percent/100U);
+    detected_hz=0;
+    if ((uint32_t)(raw_hi-raw_lo)<SIGNAL_MIN_COUNTS) return;
+
+    uint16_t mid=(uint16_t)(raw_lo+(raw_hi-raw_lo)/2U);
+    uint16_t hyst=(uint16_t)((raw_hi-raw_lo)/20U);
+    if (hyst<4U) hyst=4U;
+    uint8_t armed=(uint8_t)(samples[0]<mid-hyst);
+    uint32_t first=0, last=0, edges=0;
+    uint32_t min_delta=0xFFFFFFFFU, max_delta=0;
+    for (uint32_t i=1; i<ADC_COUNT; ++i) {
+        if (samples[i]<mid-hyst) armed=1;
+        if (armed && samples[i-1U]<mid && samples[i]>=mid) {
+            uint32_t crossing=(i-1U)*65536U+
+                (((uint32_t)(mid-samples[i-1U])<<16)/
+                 (uint32_t)(samples[i]-samples[i-1U]));
+            if (edges==0U) first=crossing;
+            else {
+                uint32_t delta=crossing-last;
+                if (delta<min_delta) min_delta=delta;
+                if (delta>max_delta) max_delta=delta;
+            }
+            last=crossing; ++edges; armed=0;
+        }
+    }
+    /* At least two complete, reasonably consistent periods; noise is not Hz. */
+    if (edges>=3U && last>first) {
+        uint32_t mean=(last-first)/(edges-1U);
+        if (mean>=131072U && max_delta-min_delta<=mean/4U+131072U) {
+            uint64_t denominator=(uint64_t)period_ticks*(last-first);
+            detected_hz=(uint32_t)divide_u64(
+                (uint64_t)SYSCLK_HZ*(edges-1U)*65536U+denominator/2U,denominator);
+        }
+    }
+}
+
+/* One-shot autoset: start fast, extend the observation window only if needed. */
+static void autoset_step(void)
+{
+    if (detected_hz==0U && probe_index+1U<sizeof(probe_ticks)/sizeof(probe_ticks[0])) {
+        ++probe_index;
+        return;
+    }
+    if (detected_hz!=0U) {
+        /* Aim for about three cycles across ten horizontal divisions. */
+        uint32_t target=(300000U+detected_hz/2U)/detected_hz;
+        uint32_t best=0xFFFFFFFFU;
+        for (uint32_t i=0; i<sizeof(time_us)/sizeof(time_us[0]); ++i) {
+            uint32_t error=time_us[i]>target ? time_us[i]-target : target-time_us[i];
+            if (error<best) { best=error; time_index=(uint8_t)i; }
+        }
+    } else {
+        /* DC/no reliable period: return to a fast 100 us/div display. */
+        time_index=5;
+    }
+    int32_t lo=input_mv(raw_lo), hi=input_mv(raw_hi);
+    uint32_t needed=(uint32_t)(hi-lo)*5U/4U; /* Leave vertical headroom. */
+    volt_index=(uint8_t)(sizeof(volts_mv)/sizeof(volts_mv[0])-1U);
+    for (uint32_t i=0; i<sizeof(volts_mv)/sizeof(volts_mv[0]); ++i) {
+        if (4U*volts_mv[i]>=needed) { volt_index=(uint8_t)i; break; }
+    }
+    display_bottom_mv=lo+(hi-lo)/2-(int32_t)(2U*volts_mv[volt_index]);
+    trigger_percent=50;
+    autoset_busy=0;
+    /* The next DMA block is captured using the NEW timebase before drawing. */
+}
+
+static void build_trace(void)
+{
+    uint16_t level=(uint16_t)(raw_lo+(uint32_t)(raw_hi-raw_lo)*trigger_percent/100U);
     uint32_t span_q16=(uint32_t)divide_u64((uint64_t)time_us[time_index]*10U*
-                          SYSCLK_HZ*65536U,(uint64_t)period_ticks*1000000U);
+                         SYSCLK_HZ*65536U,(uint64_t)period_ticks*1000000U);
+    if (span_q16>(ADC_COUNT-2U)*65536U) span_q16=(ADC_COUNT-2U)*65536U;
     uint32_t span=(span_q16+65535U)>>16;
-    uint32_t start=0;
+    uint32_t start=0, limit=ADC_COUNT-2U-span;
     triggered=0;
-    if ((uint32_t)(hi-lo)>=16U) {
-        for (uint32_t i=1; i<ADC_COUNT-span-2U && i<ADC_COUNT/2U; ++i) {
-            if (samples[i-1U]<level && samples[i]>=level) {
+    if ((uint32_t)(raw_hi-raw_lo)>=SIGNAL_MIN_COUNTS) {
+        uint16_t hyst=(uint16_t)((raw_hi-raw_lo)/20U);
+        if (hyst<4U) hyst=4U;
+        uint8_t armed=(uint8_t)(samples[0]<level-hyst);
+        for (uint32_t i=1; i<=limit && i<ADC_COUNT/2U; ++i) {
+            if (samples[i]<level-hyst) armed=1;
+            if (armed && samples[i-1U]<level && samples[i]>=level) {
                 start=i; triggered=1; break;
             }
         }
     }
+    uint32_t pos=0, error=0;
+    const uint32_t step=span_q16/(LCD_W-1U), remainder=span_q16%(LCD_W-1U);
     for (uint32_t x=0; x<LCD_W; ++x) {
-        uint32_t pos=(uint32_t)divide_u64((uint64_t)x*span_q16,LCD_W-1U);
         uint32_t i=start+(pos>>16), frac=pos&65535U;
-        /* Interpolation connects actual samples; it does not increase bandwidth. */
+        /* Interpolation connects actual samples; it does not add bandwidth. */
         trace[x]=(uint16_t)(((uint32_t)samples[i]*(65536U-frac)+
-                             (uint32_t)samples[i+1U]*frac+32768U)>>16);
+                            (uint32_t)samples[i+1U]*frac+32768U)>>16);
+        /* Exact floor(x*span/319), without 320 software 64-bit divisions. */
+        pos+=step; error+=remainder;
+        if (error>=LCD_W-1U) { ++pos; error-=LCD_W-1U; }
     }
-    uint16_t visible_lo=4095, visible_hi=0;
+    uint16_t lo=4095, hi=0;
     for (uint32_t i=start; i<=start+span; ++i) {
         uint16_t s=samples[i];
-        if (s<visible_lo) visible_lo=s;
-        if (s>visible_hi) visible_hi=s;
+        if (s<lo) lo=s;
+        if (s>hi) hi=s;
     }
-    vmin_mv=input_mv(visible_lo); vmax_mv=input_mv(visible_hi);
-    vpp_mv=vmax_mv-vmin_mv;
-    high_clip=(uint8_t)(hi>=4090U);
-    /* Schmitt-armed midpoint crossings; average all complete measured periods. */
-    frequency_hz=0;
-    if ((uint32_t)(hi-lo)>=20U) {
-        uint16_t mid=(uint16_t)(lo+(hi-lo)/2U), hyst=(uint16_t)((hi-lo)/20U);
-        if (hyst<4U) hyst=4U;
-        uint8_t armed=0;
-        uint32_t first=0, last=0, edges=0;
-        for (uint32_t i=1; i<ADC_COUNT; ++i) {
-            if (samples[i]<mid-hyst) armed=1;
-            if (armed && samples[i-1U]<mid && samples[i]>=mid) {
-                uint32_t crossing=(i-1U)*65536U+
-                    (uint32_t)divide_u64((uint64_t)(mid-samples[i-1U])*65536U,
-                                         samples[i]-samples[i-1U]);
-                if (edges==0U) first=crossing;
-                last=crossing; ++edges; armed=0;
-            }
-        }
-        if (edges>=2U && last>first)
-            frequency_hz=(uint32_t)divide_u64((uint64_t)SYSCLK_HZ*(edges-1U)*65536U,
-                                            (uint64_t)period_ticks*(last-first));
-    }
+    vmin_mv=input_mv(lo); vmax_mv=input_mv(hi); vpp_mv=vmax_mv-vmin_mv;
+    high_clip=(uint8_t)(raw_hi>=4090U);
+    frequency_hz=detected_hz;
     last_period=period_ticks;
     have_trace=1;
 }
 
+static uint16_t grid_color(uint32_t x, uint32_t y)
+{
+    return (x%32U==0U || y%48U==0U || y==PLOT_H-1U) ? GRID : BLACK;
+}
+
+/* Send the background only once at boot. */
+static void draw_grid(void)
+{
+    lcd_window(0,PLOT_TOP,LCD_W-1U,PLOT_TOP+PLOT_H-1U);
+    for (uint32_t y=0; y<PLOT_H; ++y) {
+        for (uint32_t x=0; x<LCD_W; ++x) pixel_color(grid_color(x,y));
+        keys_scan();
+    }
+    lcd_close();
+}
+
+static void plot_column(uint32_t x, uint16_t from, uint16_t to,
+                        uint16_t new_top, uint16_t new_bottom)
+{
+    lcd_window((uint16_t)x,(uint16_t)(PLOT_TOP+from),
+               (uint16_t)x,(uint16_t)(PLOT_TOP+to));
+    for (uint32_t y=from; y<=to; ++y)
+        pixel_color(y>=new_top && y<=new_bottom ? RED : grid_color(x,y));
+    lcd_close();
+}
+
 static void draw_plot(void)
 {
-    int32_t full_height=(int32_t)(4U*volts_mv[volt_index]);
+    if (!have_trace) return;
+    uint32_t full_height=4U*volts_mv[volt_index];
     for (uint32_t x=0; x<LCD_W; ++x) {
-        int32_t mv=have_trace ? input_mv(trace[x]) : 0;
-        uint32_t height=mv<=0 ? 0U :
-            (uint32_t)divide_u64((uint64_t)(uint32_t)mv*(PLOT_H-1U),(uint32_t)full_height);
+        int32_t relative=input_mv(trace[x])-display_bottom_mv;
+        uint32_t height=relative<=0 ? 0U : (uint32_t)relative*(PLOT_H-1U)/full_height;
         if (height>PLOT_H-1U) height=PLOT_H-1U;
         trace_y[x]=(uint16_t)(PLOT_H-1U-height);
     }
-    /* One streamed row at a time; no full-screen framebuffer is allocated. */
-    for (uint32_t y=0; y<PLOT_H; ++y) {
-        lcd_window(0,(uint16_t)(PLOT_TOP+y),319,(uint16_t)(PLOT_TOP+y));
-        for (uint32_t x=0; x<LCD_W; ++x) {
-            uint16_t c=(x%32U==0U || y%48U==0U || y==PLOT_H-1U) ? GRID : BLACK;
-            if (have_trace) {
-                uint16_t a=trace_y[x], b=trace_y[x==0U ? 0U : x-1U];
-                uint16_t top=a<b ? a : b, bottom=a>b ? a : b;
-                if (y>=top && y<=bottom) c=RED;
+    /* Repair old line segments and draw new ones without clearing the plot. */
+    for (uint32_t x=0; x<LCD_W; ++x) {
+        uint32_t previous=x==0U ? 0U : x-1U;
+        uint16_t a=trace_y[x], b=trace_y[previous];
+        uint16_t top=a<b ? a : b, bottom=a>b ? a : b;
+        if (!plot_valid) plot_column(x,top,bottom,top,bottom);
+        else {
+            a=old_y[x]; b=old_y[previous];
+            uint16_t old_top=a<b ? a : b, old_bottom=a>b ? a : b;
+            if (top!=old_top || bottom!=old_bottom) {
+                if (old_bottom+1U<top || bottom+1U<old_top) {
+                    /* Disjoint segments: do not transmit the empty gap. */
+                    plot_column(x,old_top,old_bottom,top,bottom);
+                    plot_column(x,top,bottom,top,bottom);
+                } else {
+                    uint16_t from=top<old_top ? top : old_top;
+                    uint16_t to=bottom>old_bottom ? bottom : old_bottom;
+                    plot_column(x,from,to,top,bottom);
+                }
             }
-            pixel_color(c);
         }
-        lcd_close();
-        keys_scan(); /* Do not lose button presses during a screen transfer. */
+        if ((x&7U)==0U) keys_scan();
     }
+    /* Copy only after ALL columns used the previous frame's vertices. */
+    for (uint32_t x=0; x<LCD_W; ++x) old_y[x]=trace_y[x];
+    plot_valid=1;
 }
 
 static void draw_labels(void)
 {
-    const char *settings[]={"TIME","VOLTS","TRIG"};
     char line[64];
-    lcd_fill(0,0,320,32,BLACK);
-    lcd_fill(0,224,320,16,BLACK);
     line[0]=0;
-    text_append(line,sizeof(line),"F401 SCOPE ");
-    text_append(line,sizeof(line),fault ? "ERROR" : (hold ? "HOLD" : "RUN"));
-    text_append(line,sizeof(line)," ");
-    text_append(line,sizeof(line),settings[selected]);
-    text_append(line,sizeof(line)," ");
-    text_append(line,sizeof(line),triggered ? "TRIGGERED" : "AUTO");
-    lcd_text(0,0,line,hold ? YELLOW : GREEN);
+    text_append(line,sizeof(line),"F401 ");
+    text_append(line,sizeof(line),fault ? "ERROR" :
+                (hold ? "HOLD" : (autoset_busy ? "AUTOSET" : "RUN")));
+    text_append(line,sizeof(line),triggered ? " TRIG UPD:" : " FREE UPD:");
+    text_uint(line,sizeof(line),update_ms);
+    text_append(line,sizeof(line),"MS");
+    label_draw(0,line,hold || fault ? YELLOW : GREEN);
+
     uint32_t t=time_us[time_index];
     line[0]=0;
     text_append(line,sizeof(line),"T:");
     text_uint(line,sizeof(line),t>=1000U ? t/1000U : t);
     text_append(line,sizeof(line),t>=1000U ? "MS/DIV V:" : "US/DIV V:");
     text_volts(line,sizeof(line),(int32_t)volts_mv[volt_index]);
-    text_append(line,sizeof(line),"V/DIV TR:");
-    text_uint(line,sizeof(line),trigger_percent);
-    text_append(line,sizeof(line),"%");
-    lcd_text(0,10,line,WHITE);
+    text_append(line,sizeof(line),"V/DIV B:");
+    text_volts(line,sizeof(line),display_bottom_mv);
+    text_append(line,sizeof(line),"V");
+    label_draw(1,line,WHITE);
+
     line[0]=0;
     text_append(line,sizeof(line),"MIN:"); text_volts(line,sizeof(line),vmin_mv);
     text_append(line,sizeof(line)," MAX:"); text_volts(line,sizeof(line),vmax_mv);
     text_append(line,sizeof(line)," PP:"); text_volts(line,sizeof(line),vpp_mv);
     text_append(line,sizeof(line),"V");
-    lcd_text(0,20,line,WHITE);
+    label_draw(2,line,WHITE);
+
     if (fault) {
-        lcd_text(0,228,fault==2U ? "DMA ERROR - HOLD TO RETRY" :
-                      (fault==3U ? "ADC OVERRUN - HOLD TO RETRY" :
-                                   "ADC TIMEOUT - HOLD TO RETRY"),YELLOW);
+        label_draw(3,fault==2U ? "DMA ERROR - PA2 RETRY" :
+                       (fault==3U ? "ADC OVERRUN - PA2 RETRY" :
+                                    "ADC TIMEOUT - PA2 RETRY"),YELLOW);
+    } else if (autoset_busy) {
+        label_draw(3,"AUTOSET SEARCH - PA2 TO HOLD",YELLOW);
     } else {
         uint32_t rate=SYSCLK_HZ/last_period;
         line[0]=0;
@@ -536,39 +676,24 @@ static void draw_labels(void)
         const char *status=high_clip ? "HIGH CLIP" :
             (frequency_hz!=0U && frequency_hz>rate/10U ? "FEW SAMPLES" : "");
         text_append(line,sizeof(line)," "); text_append(line,sizeof(line),status);
-        lcd_text(0,228,line,high_clip ? YELLOW : WHITE);
+        label_draw(3,line,high_clip ? YELLOW : WHITE);
     }
-    keys_scan();
 }
 
 static void apply_keys(uint8_t keys)
 {
     if (active) capture_stop();
-    if (keys&1U) {
+    if (keys&KEY_AUTO) {
+        hold=0; fault=0; probe_index=0; autoset_busy=1;
+        draw_labels();
+        return;
+    }
+    if (keys&KEY_RUN) {
         if (fault) { fault=0; hold=0; }
         else hold^=1U;
+        if (hold) autoset_busy=0;
+        draw_labels();
     }
-    if (keys&8U) selected=(uint8_t)((selected+1U)%3U);
-    int32_t step=(keys&2U ? 1 : 0)-(keys&4U ? 1 : 0);
-    uint8_t redraw=0;
-    if (step!=0) {
-        if (selected==0U && !hold) {
-            /* UP = faster sweep; DOWN = slower sweep. */
-            int32_t i=(int32_t)time_index-step;
-            if (i>=0 && i<(int32_t)(sizeof(time_us)/sizeof(time_us[0]))) time_index=(uint8_t)i;
-        } else if (selected==1U) {
-            /* UP = vertical magnification (smaller V/div). */
-            int32_t i=(int32_t)volt_index-step;
-            if (i>=0 && i<(int32_t)(sizeof(volts_mv)/sizeof(volts_mv[0]))) {
-                volt_index=(uint8_t)i; redraw=1;
-            }
-        } else if (selected==2U && !hold) {
-            int32_t p=(int32_t)trigger_percent+step*5;
-            if (p>=5 && p<=95) trigger_percent=(uint8_t)p;
-        }
-    }
-    if (redraw) draw_plot();
-    draw_labels();
 }
 
 int main(void)
@@ -576,8 +701,9 @@ int main(void)
     clock_init();
     timebase_init();
     pins_init();
+    calibration_init();
     lcd_init();
-    draw_plot();
+    draw_grid();
     draw_labels();
     for (;;) {
         keys_scan();
@@ -588,13 +714,28 @@ int main(void)
         }
         if (hold) continue;
         if (!active) capture_start();
+        /* Limit UI work to 30 Hz; long sweeps are limited by acquisition. */
+        if (!autoset_busy && have_trace &&
+            (uint32_t)(micros_now()-last_frame_started)<FRAME_INTERVAL_US) continue;
         uint8_t result=capture_poll();
         if (result==1U) {
-            analyze_capture();
+            measure_capture();
+            if (autoset_busy) {
+                autoset_step();
+                capture_start();
+                continue;
+            }
+            build_trace();
+            last_frame_started=micros_now();
+            /* trace[] and measurements are now independent of samples[]. */
+            capture_start();
             draw_plot();
+            uint32_t now=micros_now();
+            if (last_frame_done!=0U) update_ms=(uint32_t)(now-last_frame_done)/1000U;
+            last_frame_done=now;
             draw_labels();
         } else if (result>1U) {
-            fault=result; hold=1;
+            fault=result; hold=1; autoset_busy=0;
             draw_labels();
         }
     }
